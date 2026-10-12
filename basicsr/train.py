@@ -15,6 +15,10 @@ from basicsr.utils import (MessageLogger, check_resume, get_env_info,
                            get_root_logger, get_time_str, init_tb_logger,
                            init_wandb_logger, make_exp_dirs, mkdir_and_rename,
                            set_random_seed)
+from basicsr.utils.holo_protocol import (configure_determinism,
+                                         validate_determinism,
+                                         validate_experiment_options,
+                                         validate_runtime_versions)
 from basicsr.utils.dist_util import get_dist_info, init_dist
 from basicsr.utils.options import dict2str, parse
 
@@ -52,7 +56,17 @@ def parse_options(is_train=True):
     if seed is None:
         seed = random.randint(1, 10000)
         opt['manual_seed'] = seed
-    set_random_seed(seed + opt['rank'])
+    deterministic = opt.get('determinism', {
+        'enabled': True, 'cudnn_deterministic': True,
+        'cudnn_benchmark': False, 'use_deterministic_algorithms': True})
+    configure_determinism(seed + opt['rank'], deterministic)
+    validate_determinism(deterministic)
+    validate_experiment_options(opt)
+    runtime = opt.get('runtime', {})
+    if bool(runtime.get('validate_on_startup', False)):
+        # The full environment (including the frozen LPIPS checkpoint) is
+        # validated before either network is allowed to start.
+        validate_runtime_versions(runtime, require_lpips=True)
 
     return opt
 
@@ -86,7 +100,8 @@ def create_train_val_dataloader(opt, logger):
             dataset_enlarge_ratio = dataset_opt.get('dataset_enlarge_ratio', 1)
             train_set = create_dataset(dataset_opt)
             train_sampler = EnlargedSampler(train_set, opt['world_size'],
-                                            opt['rank'], dataset_enlarge_ratio)
+                                            opt['rank'], dataset_enlarge_ratio,
+                                            seed=opt['manual_seed'])
             train_loader = create_dataloader(
                 train_set,
                 dataset_opt,
@@ -131,8 +146,9 @@ def main():
     # parse options, set distributed setting, set ramdom seed
     opt = parse_options(is_train=True)
 
-    torch.backends.cudnn.benchmark = True
-    # torch.backends.cudnn.deterministic = True
+    # configure_determinism() in parse_options has already set and verified
+    # these flags.  Do not enable benchmark here: it can choose nondeterministic
+    # kernels and would make the two network variants incomparable.
 
     # automatic resume ..
     state_folder_path = 'experiments/{}/training_states/'.format(opt['name'])
@@ -209,69 +225,77 @@ def main():
 
     # for epoch in range(start_epoch, total_epochs + 1):
 
-    iters = opt['datasets']['train'].get('iters')
-    batch_size = opt['datasets']['train'].get('batch_size_per_gpu')
-    mini_batch_sizes = opt['datasets']['train'].get('mini_batch_sizes')
-    gt_size = opt['datasets']['train'].get('gt_size')
-    mini_gt_sizes = opt['datasets']['train'].get('gt_sizes')
-
-    groups = np.array([sum(iters[0:i + 1]) for i in range(0, len(iters))])
-
-    logger_j = [True] * len(groups)
-
+    # ``current_iter`` is an optimizer update, never a micro-batch.  This is
+    # important when OOM recovery changes the micro-batch and accumulation.
+    grad_accum_steps = int(opt['train'].get('gradient_accumulation_steps', 1))
+    if grad_accum_steps < 1:
+        raise ValueError('gradient_accumulation_steps must be >= 1')
+    train_opt = opt['datasets']['train']
+    iters = train_opt.get('iters')
+    batch_size = train_opt.get('batch_size_per_gpu')
+    mini_batch_sizes = train_opt.get('mini_batch_sizes')
+    gt_size = train_opt.get('gt_size')
+    mini_gt_sizes = train_opt.get('gt_sizes')
+    use_progressive = bool(iters and mini_batch_sizes and mini_gt_sizes)
+    if use_progressive:
+        groups = np.array([sum(iters[0:i + 1]) for i in range(0, len(iters))])
+        logger_j = [True] * len(groups)
+    else:
+        groups = None
+        logger_j = []
     scale = opt['scale']
 
     epoch = start_epoch
-    while current_iter <= total_iters:
+    micro_step = 0
+    while current_iter < total_iters:
         train_sampler.set_epoch(epoch)
         prefetcher.reset()
         train_data = prefetcher.next()
 
-        while train_data is not None:
+        while train_data is not None and current_iter < total_iters:
             data_time = time.time() - data_time
+            next_iter = current_iter + 1
+            if (micro_step + 1) % grad_accum_steps == 0:
+                # Scheduler steps once per effective optimizer update.
+                model.update_learning_rate(
+                    next_iter,
+                    warmup_iter=opt['train'].get('warmup_iter', -1),
+                    warmup_init_ratio=opt['train'].get('warmup_init_ratio', 0.0))
 
-            current_iter += 1
-            if current_iter > total_iters:
-                break
-            # update learning rate
-            model.update_learning_rate(
-                current_iter, warmup_iter=opt['train'].get('warmup_iter', -1))
-
-            
-            ### ------Progressive learning ---------------------
-            j = ((current_iter>groups) !=True).nonzero()[0]
-            if len(j) == 0:
-                bs_j = len(groups) - 1
+            if use_progressive:
+                j = ((next_iter > groups) != True).nonzero()[0]
+                bs_j = len(groups) - 1 if len(j) == 0 else j[0]
+                mini_gt_size = mini_gt_sizes[bs_j]
+                mini_batch_size = mini_batch_sizes[bs_j]
+                if logger_j[bs_j]:
+                    logger.info('\n Updating Patch_Size to {} and Batch_Size to {} \n'.format(
+                        mini_gt_size, mini_batch_size * max(torch.cuda.device_count(), 1)))
+                    logger_j[bs_j] = False
+                lq = train_data['lq']
+                gt = train_data['gt']
+                if mini_batch_size < batch_size:
+                    indices = random.sample(range(0, batch_size), k=mini_batch_size)
+                    lq, gt = lq[indices], gt[indices]
+                if mini_gt_size < gt_size:
+                    x0 = int((gt_size - mini_gt_size) * random.random())
+                    y0 = int((gt_size - mini_gt_size) * random.random())
+                    x1, y1 = x0 + mini_gt_size, y0 + mini_gt_size
+                    lq = lq[:, :, x0:x1, y0:y1]
+                    gt = gt[:, :, x0 * scale:x1 * scale, y0 * scale:y1 * scale]
             else:
-                bs_j = j[0]
+                lq, gt = train_data['lq'], train_data['gt']
 
-            mini_gt_size = mini_gt_sizes[bs_j]
-            mini_batch_size = mini_batch_sizes[bs_j]
-            
-            if logger_j[bs_j]:
-                logger.info('\n Updating Patch_Size to {} and Batch_Size to {} \n'.format(mini_gt_size, mini_batch_size*torch.cuda.device_count())) 
-                logger_j[bs_j] = False
-
-            lq = train_data['lq']
-            gt = train_data['gt']
-
-            if mini_batch_size < batch_size:
-                indices = random.sample(range(0, batch_size), k=mini_batch_size)
-                lq = lq[indices]
-                gt = gt[indices]
-
-            if mini_gt_size < gt_size:
-                x0 = int((gt_size - mini_gt_size) * random.random())
-                y0 = int((gt_size - mini_gt_size) * random.random())
-                x1 = x0 + mini_gt_size
-                y1 = y0 + mini_gt_size
-                lq = lq[:,:,x0:x1,y0:y1]
-                gt = gt[:,:,x0*scale:x1*scale,y0*scale:y1*scale]
-            ###-------------------------------------------
-
-            
             model.feed_train_data({'lq': lq, 'gt':gt})
-            model.optimize_parameters(current_iter)
+            micro_step += 1
+            did_update = model.optimize_parameters(next_iter)
+
+            if not did_update:
+                data_time = time.time()
+                iter_time = time.time()
+                train_data = prefetcher.next()
+                continue
+
+            current_iter = next_iter
 
             iter_time = time.time() - iter_time
             # log

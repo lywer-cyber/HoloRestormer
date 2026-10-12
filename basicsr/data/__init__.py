@@ -91,19 +91,40 @@ def create_dataloader(dataset,
             num_workers=num_workers,
             sampler=sampler,
             drop_last=True)
+        # The explicit generator pins DataLoader's own base_seed.  The
+        # sampler and worker_init_fn below use the same experiment seed.
+        if seed is not None:
+            generator = torch.Generator()
+            generator.manual_seed(int(seed))
+            dataloader_args['generator'] = generator
         if sampler is None:
             dataloader_args['shuffle'] = True
         dataloader_args['worker_init_fn'] = partial(
             worker_init_fn, num_workers=num_workers, rank=rank,
             seed=seed) if seed is not None else None
-    elif phase in ['val', 'test']:  # validation
+    elif phase in ['val', 'test']:
+        # The holographic protocol evaluates one native-resolution image at a
+        # time.  Do not silently fall back to a different loader geometry.
+        batch_size = int(dataset_opt.get('batch_size_per_gpu', 1))
+        num_workers = int(dataset_opt.get('num_worker_per_gpu', 0))
+        if dataset_opt.get('holo_protocol', False) or dataset_opt.get(
+                'whole_image', False):
+            if batch_size != 1 or num_workers != 0:
+                raise ValueError(
+                    f'{phase} holographic dataloader requires batch_size=1 and num_workers=0')
         dataloader_args = dict(
-            dataset=dataset, batch_size=1, shuffle=False, num_workers=0)
+            dataset=dataset, batch_size=batch_size, shuffle=False,
+            num_workers=num_workers)
     else:
         raise ValueError(f'Wrong dataset phase: {phase}. '
                          "Supported ones are 'train', 'val' and 'test'.")
 
-    dataloader_args['pin_memory'] = dataset_opt.get('pin_memory', False)
+    pin_memory = bool(dataset_opt.get('pin_memory', False))
+    persistent_workers = bool(dataset_opt.get('persistent_workers', False))
+    if persistent_workers and num_workers == 0:
+        raise ValueError('persistent_workers requires num_workers > 0')
+    dataloader_args['pin_memory'] = pin_memory
+    dataloader_args['persistent_workers'] = persistent_workers
 
     prefetch_mode = dataset_opt.get('prefetch_mode')
     if prefetch_mode == 'cpu':  # CPUPrefetcher
@@ -124,3 +145,4 @@ def worker_init_fn(worker_id, num_workers, rank, seed):
     worker_seed = num_workers * rank + worker_id + seed
     np.random.seed(worker_seed)
     random.seed(worker_seed)
+    torch.manual_seed(worker_seed)

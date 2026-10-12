@@ -61,8 +61,15 @@ def parse(opt_path, is_train=True):
         if (val is not None) and ('resume_state' in key
                                   or 'pretrain_network' in key):
             opt['path'][key] = osp.expanduser(val)
-    opt['path']['root'] = osp.abspath(
-        osp.join(__file__, osp.pardir, osp.pardir, osp.pardir))
+    # Keep the upstream repository default, but allow the unified holography
+    # runner to place experiments under the configured project root.  This is
+    # deliberately an option-file path, never a hard-coded server path.
+    configured_root = opt['path'].get('root')
+    if configured_root:
+        opt['path']['root'] = osp.abspath(osp.expanduser(configured_root))
+    else:
+        opt['path']['root'] = osp.abspath(
+            osp.join(__file__, osp.pardir, osp.pardir, osp.pardir))
     if is_train:
         experiments_root = osp.join(opt['path']['root'], 'experiments',
                                     opt['name'])

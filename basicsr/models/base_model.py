@@ -180,7 +180,8 @@ class BaseModel():
                 [v['initial_lr'] for v in optimizer.param_groups])
         return init_lr_groups_l
 
-    def update_learning_rate(self, current_iter, warmup_iter=-1):
+    def update_learning_rate(self, current_iter, warmup_iter=-1,
+                             warmup_init_ratio=0.0):
         """Update learning rate.
 
         Args:
@@ -199,8 +200,9 @@ class BaseModel():
             # currently only support linearly warm up
             warm_up_lr_l = []
             for init_lr_g in init_lr_g_l:
-                warm_up_lr_l.append(
-                    [v / warmup_iter * current_iter for v in init_lr_g])
+                ratio = float(warmup_init_ratio) + (
+                    1.0 - float(warmup_init_ratio)) * current_iter / warmup_iter
+                warm_up_lr_l.append([v * ratio for v in init_lr_g])
             # set learning rate
             self._set_lr(warm_up_lr_l)
 
@@ -328,6 +330,10 @@ class BaseModel():
                 state['optimizers'].append(o.state_dict())
             for s in self.schedulers:
                 state['schedulers'].append(s.state_dict())
+            if hasattr(self, 'grad_scaler'):
+                state['grad_scaler'] = self.grad_scaler.state_dict()
+            if hasattr(self, '_micro_step'):
+                state['micro_step'] = int(self._micro_step)
             save_filename = f'{current_iter}.state'
             save_path = os.path.join(self.opt['path']['training_states'],
                                      save_filename)
